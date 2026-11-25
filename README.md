@@ -41,6 +41,39 @@ Format documentation on how Chromium-based browsers store credentials and cookie
 | Cross-host, Chrome < 127 | ✅ | ✅ | ✅ |
 | Cross-host, Chrome 127+ | ❌ | ✅ | ✅ |
 
+### Measured on Chrome/Edge/Brave 158, no TPM
+
+| Finding | Evidence |
+|---|---|
+| ABE wrap is a plain DPAPI blob behind a 4-byte `APPB` marker — no CNG, no TPM | provider GUID `DF9D8CD0-…` at blob offset 4 |
+| Its master key is **not** in the user's Protect store | `DF9A3E03-…` (Chrome), `BFB9D720-…` (Edge/Brave) absent from `%APPDATA%\Microsoft\Protect` |
+| Edge ships an ABE key but still writes `v10` | 197/197 cookies and 183/183 passwords decrypted with plain DPAPI |
+| Chrome has fully migrated | 0/40 `v20` blobs open with the v10 key |
+| A running browser locks its cookie DB (share mode 0) | `WinError 32` on copy, even with the WAL present |
+| The 2024 CLSIDs no longer resolve | not registered in HKLM/WOW6432Node/HKCU on 158 |
+
+ABE's wall is **account scope**, not cryptography.
+
+---
+
+## Scripts
+
+Read-only structural reconnaissance. None of them print a decrypted value, a cookie, a password or a key.
+
+| Script | Purpose |
+|---|---|
+| `scripts/inspect.py` | Profiles, key fields, blob prefixes, cookie `meta` version, install paths, writability, TPM, COM registration |
+| `scripts/probe2.py` | Which DPAPI layers open in your session; where ABE registers; Brave DB lock behaviour |
+| `scripts/probe3.py` | ABE blob anatomy plus an end-to-end v10 decryption proof (reports match counts only) |
+| `scripts/probe4.py` | Offset sweep of the ABE blob against `CryptUnprotectData` |
+| `scripts/probe5.py` | Parses the master key GUID and looks for it in your Protect store |
+| `scripts/probe6_system_test.py` | Run elevated/as SYSTEM to test the account-scope hypothesis |
+
+```bash
+python scripts/inspect.py
+python scripts/probe3.py
+```
+
 ---
 
 ## Scope

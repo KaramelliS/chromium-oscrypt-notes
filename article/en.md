@@ -158,11 +158,34 @@ Chrome : {708860E0-F641-4611-8895-7D867DD3675B}   (IElevator2)
 Edge   : {1FCBE96C-1697-43AF-9140-29DB18F2E706}
 ```
 
-**These CLSIDs are version-dependent.** Read them from `HKCR\CLSID` instead of hardcoding. Hardcode them and they break silently on the next major release.
+These values, published in 2024, **no longer resolve** at the end of 2026. On a machine with Chrome 158, Edge 158 and Brave 158.1 installed, none of the three is registered under `HKLM\SOFTWARE\Classes\CLSID`, nor under WOW6432Node, nor under HKCU. The service binary contains GUIDs, but none of them match these old values.
+
+The lesson is simple: **do not hardcode the CLSID.** Read it from `HKCR\CLSID` or straight out of `elevation_service.exe`. A GUID copied from a blog post becomes a silently dead constant two releases later.
 
 ### 5.3 Inside the v20 key wrap
 
-After passing through the double DPAPI wrap, `os_crypt.app_bound_encrypted_key` in `Local State` reveals this structure:
+This section is measurement, not speculation. On Chrome 158, Edge 158 and Brave 158.1 at the end of 2026, `os_crypt.app_bound_encrypted_key` has this byte layout:
+
+```
+4150504201000000...     "APPB" + 0x00000001
+d08c9ddf0115d1118c7a00c04fc297eb...   ← DPAPI provider GUID
+```
+
+`DF9D8CD0-1501-11D1-8C7A-00C04FC297EB` is Windows' standard DPAPI provider. So the wrap is **an ordinary DPAPI blob** with a 4-byte `APPB` marker in front. No CNG, no TPM, no ChaCha — at least on this machine.
+
+Parsing the master key GUID inside the blob gives this:
+
+| Browser | master key | In the user's Protect store |
+|---|---|---|
+| Chrome | `DF9A3E03-…-ACE50E51608E` | **no** |
+| Edge | `BFB9D720-…-CB821EF2222C` | **no** |
+| Brave | `BFB9D720-…-CB821EF2222C` | **no** |
+
+For comparison, the legacy `encrypted_key` in the same `Local State` uses `3312E042-…` and that one **is** in the user's store. That is the difference: the v10 wrap is sealed to the user account, the v20 wrap is sealed to a different account context (the elevation service).
+
+So ABE's wall is not cryptographic, it is **account scope**. `CryptUnprotectData` fails in a medium-integrity user process because the key belongs to a different account.
+
+Once the wrap opens, the remaining payload has this structure:
 
 ```
 [len]            install path: "C:\Program Files\Google\Chrome"
@@ -172,9 +195,7 @@ After passing through the double DPAPI wrap, `os_crypt.app_bound_encrypted_key` 
 [16]             GCM tag
 ```
 
-The presence of the path inside the encrypted payload is no accident — the ABE service compares the caller's path against this value. The path is part of authentication.
-
-The 32-byte ciphertext decrypts to exactly a 32-byte AES-256 key. The IV and tag are the rest of the structure.
+The presence of the path inside the encrypted payload is no accident — the service compares the caller's path against this value. The path is part of authentication.
 
 ### 5.4 Version treadmill
 
@@ -234,7 +255,7 @@ The ✅ marks on the macOS rows are not an oversight but an observation: ABE has
 
 The `dumpkeys` / `archive` / `restore` model of tools like `moonD4rk/HackBrowserData` was this: extract the key on machine A, decrypt the database on machine B. In the v10/v11 world this was entirely valid, because the key was just an AES key and it could be carried as a file.
 
-ABE killed that model. The v20 key is wrapped by a TPM-bound, non-exportable CNG key. Copy `Local State` to another machine and the TPM differs, so decryption fails — and it is not even clear at which stage it failed, because the error surface is narrow.
+ABE killed that model. But not for the reason usually assumed — it is not TPM. It fails on a machine with no TPM at all. The real reason: the v20 wrap's DPAPI master key is not in the user's Protect store, it lives in another account's context. Copy `Local State` to another machine and both the master key and the account context are missing. The error surface is narrow, so you cannot even see which stage died.
 
 So the technical life of "pull it from every machine" ended in 2024. What remains is "on every machine, in that machine's own context" — a different claim.
 
@@ -290,7 +311,37 @@ And an honest table in the README. An inflated promise collapses in the first is
 
 ---
 
-## 9. Verifying it yourself
+## 9. Measurements — late 2026, one real machine
+
+The table below was taken on a Windows 11 machine with no TPM, in a normal medium-integrity user session. Installed versions: Chrome `158.0.8127.36`, Edge `158.0.4370.33`, Brave `158.1.100.59`, Opera (no ABE).
+
+| Measurement | Result |
+|---|---|
+| TPM | none (`Win32_Tpm` class absent) |
+| Chrome cookies | 200 rows, **all `v20`**, meta 24 |
+| Edge cookies | 197 rows, **all `v10`**, meta 24 |
+| Edge cookie decryption | **197/197 succeeded**, 197/197 host hash prefixes correct |
+| Edge passwords | 245 rows, 183 `v10` → **183/183 decrypted** |
+| Brave passwords | 23 rows, **all `v20`** |
+| Opera cookies | 14 rows, all `v10` |
+| Chrome v10 key against v20 blobs | **0/40** — the wall |
+| Brave `Network/Cookies` | WinError 32, file locked (19 processes running) |
+| Brave install dir user-writable | **yes** |
+| Chrome install dir user-writable | no |
+| 2024 CLSIDs registered | **no**, none of the three |
+| `elevation_service.exe` signers | Google LLC / Brave Software, Inc. / Microsoft Corporation |
+
+Three conclusions follow.
+
+**1. ABE rollout is uneven.** Edge at version 158 carries an `app_bound_encrypted_key` field but still writes its cookies and passwords with `v10`. So Edge has ABE but it is not engaged. Today 183 passwords and 197 cookies open with plain DPAPI, no bypass at all. In practice the softest target is not Chrome, it is Edge.
+
+**2. The lock lives in the file handle.** While Brave runs, `Network/Cookies` is opened with share mode 0. Copying it, opening it with `mode=ro`, reading the `-wal` — none of it works. That is the real obstacle to "copy the profile, open it elsewhere." The fix is either closing the browser or a VSS snapshot, and the latter requires administrator.
+
+**3. ABE's wall is account scope.** This machine has no TPM, no CNG key, no ChaCha. Just a DPAPI blob sealed to another account. So there are two ways past ABE: run in that account's context (elevation), or put code inside that account's process (injection). There is no third, cryptographic route.
+
+---
+
+## 10. Verifying it yourself
 
 ```bash
 # Windows: inspect the key wrap without printing the value
@@ -313,7 +364,7 @@ If `meta` is 24 or higher, the plaintext begins with `SHA256(host_key)`. That si
 
 ---
 
-## 10. References
+## 11. References
 
 | Project | What to look at it for |
 |---|---|
@@ -329,7 +380,7 @@ If `meta` is 24 or higher, the plaintext begins with `SHA256(host_key)`. That si
 
 ---
 
-## 11. Verification note
+## 12. Verification note
 
 Version numbers and structural details in this article rest on community observations as of late 2026. ABE internals change every few releases and the changes are not announced backwards. Do not carry this into production code without verifying in your own environment.
 

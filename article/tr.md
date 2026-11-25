@@ -159,11 +159,34 @@ Chrome : {708860E0-F641-4611-8895-7D867DD3675B}   (IElevator2)
 Edge   : {1FCBE96C-1697-43AF-9140-29DB18F2E706}
 ```
 
-**Bu CLSID'ler sürüme bağlıdır.** Koda gömmek yerine `HKCR\CLSID` altından oku. Sabit yazarsan bir sonraki major sürümde sessizce bozulur.
+2024'te yayınlanan bu değerler **2026 sonunda artık çözümlenmiyor.** Chrome 158, Edge 158 ve Brave 158.1 kurulu bir makinede `HKLM\SOFTWARE\Classes\CLSID` altında üçü de kayıtlı değil; WOW6432Node ve HKCU altında da yok. Servisin binary'sinde GUID'ler var ama hiçbiri bu eski değerlerle eşleşmiyor.
+
+Ders basit: **CLSID'yi koda gömme.** `HKCR\CLSID` altından ya da doğrudan `elevation_service.exe` içinden oku. Blog yazısından kopyalanan GUID, iki sürüm sonra sessizce ölü bir sabit haline geliyor.
 
 ### 5.3 v20 anahtar sarmalının içi
 
-`Local State`'teki `os_crypt.app_bound_encrypted_key` çift DPAPI sarmalından geçtikten sonra şu yapı ortaya çıkıyor:
+Bu bölüm tahmin değil, ölçüm. 2026 sonunda Chrome 158, Edge 158 ve Brave 158.1 üzerinde `os_crypt.app_bound_encrypted_key` alanının gerçek byte yapısı şu:
+
+```
+4150504201000000...     "APPB" + 0x00000001
+d08c9ddf0115d1118c7a00c04fc297eb...   ← DPAPI sağlayıcı GUID'i
+```
+
+`DF9D8CD0-1501-11D1-8C7A-00C04FC297EB` Windows'un standart DPAPI sağlayıcısıdır. Yani sarmal **normal bir DPAPI bloğu**, önünde sadece 4 byte'lık `APPB` işareti var. CNG yok, TPM yok, ChaCha yok — en azından bu makinede.
+
+Bloğun içindeki master key GUID'i ayrıştırdığında tablo şu:
+
+| Tarayıcı | master key | Kullanıcının Protect deposunda mı |
+|---|---|---|
+| Chrome | `DF9A3E03-…-ACE50E51608E` | **hayır** |
+| Edge | `BFB9D720-…-CB821EF2222C` | **hayır** |
+| Brave | `BFB9D720-…-CB821EF2222C` | **hayır** |
+
+Karşılaştırma için aynı `Local State`'teki eski `encrypted_key` alanı `3312E042-…` anahtarını kullanıyor ve o **kullanıcının deposunda var**. Fark burada: v10 sarmalı kullanıcı hesabına, v20 sarmalı başka bir hesap bağlamına (yükseltme servisi) mühürlenmiş.
+
+Yani ABE'nin duvarı kriptografik değil, **hesap kapsamı**. `CryptUnprotectData` çağrısı bu yüzden orta bütünlük seviyesindeki bir kullanıcı sürecinde başarısız oluyor — anahtar yanlış hesaba ait.
+
+Sarmal açıldıktan sonra kalan yük şu yapıda:
 
 ```
 [len]            kurulum yolu: "C:\Program Files\Google\Chrome"
@@ -173,9 +196,7 @@ Edge   : {1FCBE96C-1697-43AF-9140-29DB18F2E706}
 [16]             GCM tag
 ```
 
-Yolun kendisinin şifreli yükün içinde olması tesadüf değil — ABE servisi çağıranın yolunu bu değerle karşılaştırıyor. Yani yol, kimlik doğrulamanın bir parçası.
-
-32 byte ciphertext, decrypt edildiğinde tam olarak 32 byte çıkan AES-256 anahtarıdır. IV ve tag yapının geri kalanı.
+Yolun şifreli yükün içinde olması tesadüf değil — servis çağıranın yolunu bu değerle karşılaştırıyor. Yani yol, kimlik doğrulamanın bir parçası.
 
 ### 5.4 Sürüm tredmili
 
@@ -235,7 +256,7 @@ macOS satırlarındaki ✅'ler bir eksiklik değil, bir gözlem: ABE macOS'a yay
 
 `moonD4rk/HackBrowserData` gibi araçların `dumpkeys` / `archive` / `restore` modeli şuydu: A makinesinde anahtarı çıkar, B makinesinde veritabanını çöz. Bu, v10/v11 dünyasında tamamen geçerliydi, çünkü anahtar sadece bir AES anahtarıydı ve dosya olarak taşınabiliyordu.
 
-ABE bu modeli öldürdü. v20 anahtarı TPM'e bağlı, export edilemeyen bir CNG anahtarıyla sarılıyor. `Local State`'i kopyalayıp başka makinede açmayı denersen TPM farklı olur ve decrypt başarısız olur — üstelik hangi aşamada başarısız olduğu da net değil, çünkü hata yüzeyi dar.
+ABE bu modeli öldürdü. Ama sebep sanıldığı gibi TPM değil — TPM'siz bir makinede de çalışmıyor. Gerçek sebep şu: v20 sarmalının DPAPI master key'i kullanıcının Protect deposunda değil, başka bir hesap bağlamında. `Local State`'i kopyalayıp başka makinede açmayı denersen hem master key hem hesap bağlamı eksik olur. Üstelik hata yüzeyi dar, hangi aşamada öldüğünü göremezsin.
 
 Yani "her bilgisayardan çek" fikrinin teknik ömrü 2024'te bitti. Kalan şey "her bilgisayarda, o bilgisayarın kendi bağlamında çalış" — bu farklı bir iddia.
 
@@ -291,7 +312,37 @@ Ve README'de dürüst tablo. Abartılı vaat ilk issue'da çöker; ölçülü va
 
 ---
 
-## 9. Kendin doğrulamak için
+## 9. Ölçümler — 2026 sonu, gerçek bir makine
+
+Aşağıdaki tablo bir Windows 11 makinesinde, TPM olmadan, orta bütünlük seviyesindeki normal bir kullanıcı oturumunda alındı. Kurulu sürümler: Chrome `158.0.8127.36`, Edge `158.0.4370.33`, Brave `158.1.100.59`, Opera (ABE yok).
+
+| Ölçüm | Sonuç |
+|---|---|
+| TPM | yok (`Win32_Tpm` sınıfı mevcut değil) |
+| Chrome çerezleri | 200 satır, **hepsi `v20`**, meta 24 |
+| Edge çerezleri | 197 satır, **hepsi `v10`**, meta 24 |
+| Edge çerez decrypt | **197/197 başarılı**, 197/197 host hash öneki doğru |
+| Edge şifreleri | 245 satır, 183 `v10` → **183/183 decrypt** |
+| Brave şifreleri | 23 satır, **hepsi `v20`** |
+| Opera çerezleri | 14 satır, hepsi `v10` |
+| Chrome v10 anahtarıyla v20 denemesi | **0/40** — duvar |
+| Brave `Network/Cookies` | WinError 32, dosya kilitli (19 süreç çalışıyor) |
+| Brave kurulum dizini kullanıcı yazılabilir mi | **evet** |
+| Chrome kurulum dizini kullanıcı yazılabilir mi | hayır |
+| 2024 CLSID'leri kayıtlı mı | **hayır**, üçü de |
+| `elevation_service.exe` imzalayanlar | Google LLC / Brave Software, Inc. / Microsoft Corporation |
+
+Bu tablodan çıkan üç sonuç:
+
+**1. ABE dağıtımı düzensiz.** Edge, 158 sürümünde `app_bound_encrypted_key` alanını taşıyor ama çerezlerini ve şifrelerini hâlâ `v10` ile yazıyor. Yani Edge'de ABE var ama devrede değil. Bugün 183 şifre ve 197 çerez, hiçbir bypass olmadan, sadece DPAPI ile açılıyor. Pratikte en yumuşak hedef Chrome değil, Edge.
+
+**2. Kilit, dosyanın kendisinde.** Brave açıkken `Network/Cookies` dosyası paylaşıma kapalı açılıyor (share mode 0). Kopyalamak, `mode=ro` ile açmak, `-wal` okumak — hiçbiri işe yaramıyor. Bu, "profili kopyala, başka yerde aç" fikrinin önündeki gerçek engel. Çözüm ya tarayıcıyı kapatmak ya VSS snapshot almak; ikincisi yönetici ister.
+
+**3. ABE'nin duvarı hesap kapsamı.** Bu makinede TPM yok, CNG anahtarı yok, ChaCha yok. Sadece başka bir hesaba mühürlenmiş bir DPAPI bloğu var. Yani ABE'yi aşmanın iki yolu var: o hesabın bağlamında çalışmak (yükseltme) ya da o hesabın içine kod sokmak (enjeksiyon). Üçüncü bir kriptografik yol yok.
+
+---
+
+## 10. Kendin doğrulamak için
 
 ```bash
 # Windows: Local State'teki anahtarın sarmalını gör (değeri yazdırmadan)
@@ -314,7 +365,7 @@ sqlite3 "Network/Cookies" "SELECT substr(encrypted_value,1,3), length(encrypted_
 
 ---
 
-## 10. Kaynaklar
+## 11. Kaynaklar
 
 | Proje | Ne için bakılır |
 |---|---|
@@ -330,7 +381,7 @@ sqlite3 "Network/Cookies" "SELECT substr(encrypted_value,1,3), length(encrypted_
 
 ---
 
-## 11. Doğrulama notu
+## 12. Doğrulama notu
 
 Bu yazıdaki sürüm numaraları ve yapı detayları 2026 sonu itibarıyla topluluk gözlemlerine dayanıyor. ABE iç yapısı her birkaç sürümde değişiyor ve değişimler geriye dönük duyurulmuyor. Kendi ortamında doğrulamadan üretim koduna taşıma.
 
