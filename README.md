@@ -50,7 +50,8 @@ Format documentation on how Chromium-based browsers store credentials and cookie
 | Edge ships an ABE key but still writes `v10` | 197/197 cookies and 183/183 passwords decrypted with plain DPAPI |
 | Chrome has fully migrated | 0/40 `v20` blobs open with the v10 key |
 | A running browser locks its cookie DB (share mode 0) | `WinError 32` on copy, even with the WAL present |
-| The 2024 CLSIDs no longer resolve | not registered in HKLM/WOW6432Node/HKCU on 158 |
+| The 2024 Chrome CLSID still resolves; Edge's is gone | `CLSID → AppID → LocalService`, all three run as **LocalSystem** |
+| The ABE master key is not missing, it is inaccessible | `S-1-5-18\User\df9a3e03-…` readable, sealed by `DPAPI_SYSTEM` → `NTE_BAD_KEY_STATE` |
 
 ABE's wall is **account scope**, not cryptography.
 

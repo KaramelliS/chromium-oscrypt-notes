@@ -152,16 +152,27 @@ Kritik nokta: doğrulama **çağıran sürecin kimliğine** bakıyor. Bu yüzden
 
 Hepsi aynı sorunu çözüyor: kod, Chrome sürecinin içinden çalışsın ki doğrulamayı geçsin.
 
-### 5.2 COM arayüzü
+### 5.2 COM arayüzü ve gerçek kayıt zinciri
+
+Servis tabanlı COM'da `LocalServer32` alt anahtarı yoktur. Zincir şu:
 
 ```
-Chrome : {708860E0-F641-4611-8895-7D867DD3675B}   (IElevator2)
-Edge   : {1FCBE96C-1697-43AF-9140-29DB18F2E706}
+CLSID {…}  →  AppID {…}  →  LocalService  →  elevation_service.exe (LocalSystem)
 ```
 
-2024'te yayınlanan bu değerler **2026 sonunda artık çözümlenmiyor.** Chrome 158, Edge 158 ve Brave 158.1 kurulu bir makinede `HKLM\SOFTWARE\Classes\CLSID` altında üçü de kayıtlı değil; WOW6432Node ve HKCU altında da yok. Servisin binary'sinde GUID'ler var ama hiçbiri bu eski değerlerle eşleşmiyor.
+Bu makinede ölçülen tablo:
 
-Ders basit: **CLSID'yi koda gömme.** `HKCR\CLSID` altından ya da doğrudan `elevation_service.exe` içinden oku. Blog yazısından kopyalanan GUID, iki sürüm sonra sessizce ölü bir sabit haline geliyor.
+| Marka | CLSID = AppID | LocalService | Çalıştığı hesap |
+|---|---|---|---|
+| Chrome | `{708860E0-F641-4611-8895-7D867DD3675B}` | `GoogleChromeElevationService` | **LocalSystem** |
+| Brave | `{576B31AF-6369-4B6B-8560-E4B203A97A8B}` | `BraveElevationService` | **LocalSystem** |
+| Edge | `{CD489BAC-BF1F-4F4B-9DB9-39B823919EAC}` | `MicrosoftCopilotElevationService` | **LocalSystem** |
+
+Chrome'un 2024'te yayınlanan GUID'i hâlâ geçerli. Edge'inki öldü: Edge 2026'da "Copilot" uygulamasına taşındı ve yeni GUID kullanıyor. Yani "CLSID sürüme bağlı" uyarısı Edge için doğru, Chrome için değil.
+
+Buradaki en önemli satır sonuncusu: **üç servis de `LocalSystem` olarak çalışıyor.** Bir sonraki bölümdeki master key bulmacasının cevabı tam olarak bu.
+
+`LocalServer32` arayan bir prob "CLSID kayıtlı değil" sonucuna varır. Bu, bu yazının ilk sürümünde yaptığım hataydı.
 
 ### 5.3 v20 anahtar sarmalının içi
 
@@ -184,7 +195,18 @@ Bloğun içindeki master key GUID'i ayrıştırdığında tablo şu:
 
 Karşılaştırma için aynı `Local State`'teki eski `encrypted_key` alanı `3312E042-…` anahtarını kullanıyor ve o **kullanıcının deposunda var**. Fark burada: v10 sarmalı kullanıcı hesabına, v20 sarmalı başka bir hesap bağlamına (yükseltme servisi) mühürlenmiş.
 
-Yani ABE'nin duvarı kriptografik değil, **hesap kapsamı**. `CryptUnprotectData` çağrısı bu yüzden orta bütünlük seviyesindeki bir kullanıcı sürecinde başarısız oluyor — anahtar yanlış hesaba ait.
+O hesabın deposu da bulundu:
+
+```
+C:\Windows\System32\Microsoft\Protect\S-1-5-18\User\
+├── df9a3e03-044f-4442-b5f1-ace50e51608e   ← Chrome ABE master key
+├── bfb9d720-c655-4be8-9abc-cb821ef2222c   ← Edge/Brave ABE master key
+└── Preferred
+```
+
+`S-1-5-18` LocalSystem'in SID'i. Dosyalar **okunabiliyor** — listeden görebilirsin. Ama içerikleri `DPAPI_SYSTEM` LSA sırrıyla şifreli, ve o sırrı açmak SYSTEM yetkisi ister. Yani master key kayıp değil, erişilemez.
+
+Bunun sonucu şu: `CryptUnprotectData` orta bütünlükte `NTE_BAD_KEY_STATE` (`0x8009000B`) döner. Bu "anahtar yok" demek değil, "anahtar var, kullanma iznin yok" demek. ABE'nin duvarı kriptografik değil, **ayrıcalık sınırı**.
 
 Sarmal açıldıktan sonra kalan yük şu yapıda:
 
@@ -329,7 +351,9 @@ Aşağıdaki tablo bir Windows 11 makinesinde, TPM olmadan, orta bütünlük sev
 | Brave `Network/Cookies` | WinError 32, dosya kilitli (19 süreç çalışıyor) |
 | Brave kurulum dizini kullanıcı yazılabilir mi | **evet** |
 | Chrome kurulum dizini kullanıcı yazılabilir mi | hayır |
-| 2024 CLSID'leri kayıtlı mı | **hayır**, üçü de |
+| 2024 CLSID'leri | Chrome ✓ geçerli, Edge ✗ (Copilot'a taşındı) |
+| Elevation servisleri hangi hesapta | **LocalSystem**, üçü de |
+| ABE master key nerede | `C:\Windows\System32\Microsoft\Protect\S-1-5-18\User\` (okunabilir, `DPAPI_SYSTEM` ile mühürlü) |
 | `elevation_service.exe` imzalayanlar | Google LLC / Brave Software, Inc. / Microsoft Corporation |
 
 Bu tablodan çıkan üç sonuç:

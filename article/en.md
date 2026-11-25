@@ -151,16 +151,27 @@ The critical point: validation looks at the **identity of the calling process.**
 
 All of them solve the same problem: make the code execute from inside the Chrome process so it passes validation.
 
-### 5.2 COM interface
+### 5.2 COM interface and the real registration chain
+
+Service-backed COM has no `LocalServer32` subkey. The chain is:
 
 ```
-Chrome : {708860E0-F641-4611-8895-7D867DD3675B}   (IElevator2)
-Edge   : {1FCBE96C-1697-43AF-9140-29DB18F2E706}
+CLSID {…}  →  AppID {…}  →  LocalService  →  elevation_service.exe (LocalSystem)
 ```
 
-These values, published in 2024, **no longer resolve** at the end of 2026. On a machine with Chrome 158, Edge 158 and Brave 158.1 installed, none of the three is registered under `HKLM\SOFTWARE\Classes\CLSID`, nor under WOW6432Node, nor under HKCU. The service binary contains GUIDs, but none of them match these old values.
+Measured on this machine:
 
-The lesson is simple: **do not hardcode the CLSID.** Read it from `HKCR\CLSID` or straight out of `elevation_service.exe`. A GUID copied from a blog post becomes a silently dead constant two releases later.
+| Vendor | CLSID = AppID | LocalService | Runs as |
+|---|---|---|---|
+| Chrome | `{708860E0-F641-4611-8895-7D867DD3675B}` | `GoogleChromeElevationService` | **LocalSystem** |
+| Brave | `{576B31AF-6369-4B6B-8560-E4B203A97A8B}` | `BraveElevationService` | **LocalSystem** |
+| Edge | `{CD489BAC-BF1F-4F4B-9DB9-39B823919EAC}` | `MicrosoftCopilotElevationService` | **LocalSystem** |
+
+Chrome's GUID from 2024 is still valid. Edge's is dead: Edge moved to the "Copilot" application in 2026 and uses a new one. So "the CLSID is version-dependent" is true for Edge and false for Chrome.
+
+The last column is the important one: **all three services run as `LocalSystem`.** That is the answer to the master key puzzle in the next section.
+
+A probe that looks for `LocalServer32` concludes "the CLSID is not registered." That was the mistake in the first version of this article.
 
 ### 5.3 Inside the v20 key wrap
 
@@ -183,7 +194,18 @@ Parsing the master key GUID inside the blob gives this:
 
 For comparison, the legacy `encrypted_key` in the same `Local State` uses `3312E042-…` and that one **is** in the user's store. That is the difference: the v10 wrap is sealed to the user account, the v20 wrap is sealed to a different account context (the elevation service).
 
-So ABE's wall is not cryptographic, it is **account scope**. `CryptUnprotectData` fails in a medium-integrity user process because the key belongs to a different account.
+That account's store was located as well:
+
+```
+C:\Windows\System32\Microsoft\Protect\S-1-5-18\User\
+├── df9a3e03-044f-4442-b5f1-ace50e51608e   ← Chrome ABE master key
+├── bfb9d720-c655-4be8-9abc-cb821ef2222c   ← Edge/Brave ABE master key
+└── Preferred
+```
+
+`S-1-5-18` is LocalSystem's SID. The files are **readable** — you can list them. Their contents are encrypted with the `DPAPI_SYSTEM` LSA secret, and unlocking that secret requires SYSTEM. The master key is not missing, it is inaccessible.
+
+The consequence: `CryptUnprotectData` returns `NTE_BAD_KEY_STATE` (`0x8009000B`) at medium integrity. That does not mean "no key", it means "the key exists and you may not use it." ABE's wall is a **privilege boundary**, not cryptography.
 
 Once the wrap opens, the remaining payload has this structure:
 
@@ -328,7 +350,9 @@ The table below was taken on a Windows 11 machine with no TPM, in a normal mediu
 | Brave `Network/Cookies` | WinError 32, file locked (19 processes running) |
 | Brave install dir user-writable | **yes** |
 | Chrome install dir user-writable | no |
-| 2024 CLSIDs registered | **no**, none of the three |
+| 2024 CLSIDs | Chrome ✓ still valid, Edge ✗ (moved to Copilot) |
+| Elevation services run as | **LocalSystem**, all three |
+| Where the ABE master key lives | `C:\Windows\System32\Microsoft\Protect\S-1-5-18\User\` (readable, sealed by `DPAPI_SYSTEM`) |
 | `elevation_service.exe` signers | Google LLC / Brave Software, Inc. / Microsoft Corporation |
 
 Three conclusions follow.
